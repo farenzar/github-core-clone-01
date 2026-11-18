@@ -3,7 +3,7 @@
 // Pkt-line framing, sideband multiplexing, and the fetch object-selection rules
 // (want/have/deepen/shallow) live here; the object codec lives in gitobj.ts.
 
-import { ZERO_OID, isObjectId, readPack, writePack, type GitObject } from './gitobj.ts';
+import { ZERO_OID, hashObject, isObjectId, readPack, writePack, type GitObject } from './gitobj.ts';
 import type { Ctx } from './http.ts';
 import { sendBytes, sendError } from './http.ts';
 import { DEFAULT_BRANCH, type Repo as RepoType } from './store.ts';
@@ -153,11 +153,16 @@ function uploadPackV0Caps(): string {
   return [
     `symref=HEAD:refs/heads/${DEFAULT_BRANCH}`,
     'multi_ack',
+    'multi_ack_detailed',
     'thin-pack',
     'side-band',
     'side-band-64k',
     'ofs-delta',
     'shallow',
+    'deepen-since',
+    'deepen-not',
+    'deepen-relative',
+    'filter',
     `agent=${AGENT}`,
   ].join(' ');
 }
@@ -296,6 +301,39 @@ interface FetchArgs {
   haves: string[];
   shallows: string[];
   depth: number | null;
+  /** True when the request carries `done`: the client wants the pack now. */
+  done: boolean;
+  /** True when the request carries `deepen-relative`: deepen counts from the shallow boundary. */
+  relative: boolean;
+}
+
+/**
+ * Resolve a deepen request to an absolute depth. With `deepen-relative`,
+ * `deepen N` extends N levels beyond the client's current shallow boundary,
+ * which sits at (edge distance from the want) + 1 commits deep — so the
+ * equivalent absolute depth is that distance + 1 + N. Without it, the
+ * depth is already absolute.
+ */
+function resolveDepth(repo: RepoType, args: FetchArgs): number | null {
+  const { wants, shallows, depth, relative } = args;
+  if (!relative || depth === null || shallows.length === 0 || wants.length === 0) return depth;
+  const boundary = new Set(shallows);
+  let minDistance: number | null = null;
+  const seen = new Set<string>();
+  const queue: Array<{ oid: string; distance: number }> = wants.map((oid) => ({ oid, distance: 0 }));
+  while (queue.length > 0) {
+    const current = queue.shift() as { oid: string; distance: number };
+    if (seen.has(current.oid)) continue;
+    seen.add(current.oid);
+    if (boundary.has(current.oid)) {
+      minDistance = minDistance === null ? current.distance : Math.min(minDistance, current.distance);
+      continue;
+    }
+    const commit = repo.getCommit(repo.peel(current.oid));
+    if (commit === null) continue;
+    for (const parent of commit.parents) queue.push({ oid: parent, distance: current.distance + 1 });
+  }
+  return minDistance === null ? depth : minDistance + 1 + depth;
 }
 
 /** Plan a fetch: which commits to send, and the shallow-info lines. */
@@ -397,6 +435,51 @@ function collectFetchObjects(repo: RepoType, commits: readonly string[], tagWant
   return objects;
 }
 
+/**
+ * Every object the client already holds through its haves: the have commits
+ * themselves, their trees and blobs, and the have ids as sent (tag objects).
+ * An incremental fetch must not re-send any of these. The walk cuts at the
+ * request's shallow boundary, exactly like the haves' closure: the parents
+ * of a shallow commit are precisely what the client lacks.
+ */
+function heldObjects(repo: RepoType, haves: readonly string[], shallows: readonly string[]): Set<string> {
+  const shallowSet = new Set(shallows);
+  const held = new Set<string>();
+  const addTree = (treeOid: string): void => {
+    if (held.has(treeOid)) return;
+    const entries = repo.getTreeEntries(treeOid);
+    if (entries === null) return;
+    held.add(treeOid);
+    for (const entry of entries) {
+      if (entry.mode === '40000') addTree(entry.oid);
+      else held.add(entry.oid);
+    }
+  };
+  const seen = new Set<string>();
+  const stack = [...haves];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    held.add(oid);
+    const commit = repo.getCommit(repo.peel(oid));
+    if (commit === null) continue;
+    addTree(commit.tree);
+    if (shallowSet.has(oid)) continue;
+    for (const parent of commit.parents) stack.push(parent);
+  }
+  return held;
+}
+
+/** A fetch's pack: the new objects, minus everything the client already holds. */
+function fetchPack(repo: RepoType, plan: { commits: string[] }, tagWants: readonly string[], haves: readonly string[], shallows: readonly string[]): Buffer {
+  const objects = collectFetchObjects(repo, plan.commits, tagWants);
+  if (haves.length === 0) return writePack(objects);
+  const held = heldObjects(repo, haves, shallows);
+  const fresh = objects.filter((object) => !held.has(hashObject(object.type, object.data)));
+  return writePack(fresh);
+}
+
 /** Wrap pack bytes in sideband band-1 packets, chunked under the pkt-line limit. */
 function sideband(pack: Buffer): Buffer[] {
   const parts: Buffer[] = [];
@@ -417,17 +500,21 @@ function parseFetchArgs(args: readonly string[]): FetchArgs {
   const haves: string[] = [];
   const shallows: string[] = [];
   let depth: number | null = null;
+  let done = false;
+  let relative = false;
   for (const arg of args) {
     if (arg.startsWith('want ')) wants.push(arg.slice(5).trim());
     else if (arg.startsWith('have ')) haves.push(arg.slice(5).trim());
     else if (arg.startsWith('shallow ')) shallows.push(arg.slice(8).trim());
+    else if (arg === 'done') done = true;
+    else if (arg === 'deepen-relative') relative = true;
     else if (arg.startsWith('deepen ')) {
       const value = Number.parseInt(arg.slice(7).trim(), 10);
       if (Number.isFinite(value) && value > 0) depth = value;
     }
-    // thin-pack, no-progress, ofs-delta, filter, deepen-since, deepen-not, done: accepted, no effect.
+    // thin-pack, no-progress, ofs-delta, filter, deepen-since, deepen-not: accepted, no effect.
   }
-  return { wants, haves, shallows, depth };
+  return { wants, haves, shallows, depth, done, relative };
 }
 
 function fetchV2Response(repo: RepoType, args: readonly string[]): Buffer {
@@ -437,16 +524,28 @@ function fetchV2Response(repo: RepoType, args: readonly string[]): Buffer {
     h: [...parsed.haves].sort(),
     s: [...parsed.shallows].sort(),
     d: parsed.depth,
+    done: parsed.done,
+    relative: parsed.relative,
   });
   const cached = repo.fetchCache.get(cacheKey);
   if (cached !== undefined) return cached;
-  const plan = planFetch(repo, parsed);
+  // A request without `done` is a have-negotiation round: the client expects
+  // an acknowledgments section only, then sends the next round. A request
+  // with `done` expects the pack: shallow-info (when non-empty) then the
+  // packfile section, with no acknowledgments section first.
+  if (!parsed.done) {
+    const response = Buffer.concat([pkt('acknowledgments\n'), pkt('NAK\n'), pktFlush()]);
+    if (repo.fetchCache.size >= 128) repo.fetchCache.clear();
+    repo.fetchCache.set(cacheKey, response);
+    return response;
+  }
+  const plan = planFetch(repo, { ...parsed, depth: resolveDepth(repo, parsed) });
   const tagWants = parsed.wants.filter((want) => {
     const object = repo.getObject(want);
     return object !== undefined && object.type === 'tag';
   });
-  const pack = writePack(collectFetchObjects(repo, plan.commits, tagWants));
-  const parts: Buffer[] = [pkt('acknowledgments\n'), pkt('NAK\n'), pktFlush()];
+  const pack = fetchPack(repo, plan, tagWants, parsed.haves, parsed.shallows);
+  const parts: Buffer[] = [];
   if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
     parts.push(pkt('shallow-info\n'));
     for (const oid of plan.shallow) parts.push(pkt(`shallow ${oid}\n`));
@@ -474,11 +573,14 @@ function fetchV0Response(repo: RepoType, packets: readonly Packet[]): Buffer {
   const wants: string[] = [];
   const shallows: string[] = [];
   let depth: number | null = null;
+  let relative = false;
   for (const line of sections[0] ?? []) {
     if (line.startsWith('want ')) {
       // The first want line may carry capability words after the oid.
-      const token = line.slice(5).split(' ')[0] as string;
+      const tokens = line.slice(5).split(' ');
+      const token = tokens[0] as string;
       wants.push(token);
+      if (tokens.includes('deepen-relative')) relative = true;
     } else if (line.startsWith('shallow ')) shallows.push(line.slice(8).trim());
     else if (line.startsWith('deepen ')) {
       const value = Number.parseInt(line.slice(7).trim(), 10);
@@ -486,18 +588,37 @@ function fetchV0Response(repo: RepoType, packets: readonly Packet[]): Buffer {
     }
   }
   const haves: string[] = [];
+  let done = false;
   for (const line of sections[1] ?? []) {
     if (line.startsWith('have ')) haves.push(line.slice(5).trim());
+    else if (line === 'done') done = true;
   }
-  const plan = planFetch(repo, { wants, haves, shallows, depth });
+  const fetchArgs: FetchArgs = { wants, haves, shallows, depth, done, relative };
+  const plan = planFetch(repo, { ...fetchArgs, depth: resolveDepth(repo, fetchArgs) });
+  // A shallow request without `done` is round one of the v0 negotiation:
+  // the client reads only the shallow list, then re-sends the request with
+  // `done`. Answering with the full response here would leave the NAK and
+  // the pack unread, and the client would read them as round two.
+  if (!done && depth !== null) {
+    const shallowOnly: Buffer[] = [];
+    for (const oid of plan.shallow) shallowOnly.push(pkt(`shallow ${oid}\n`));
+    for (const oid of plan.unshallow) shallowOnly.push(pkt(`unshallow ${oid}\n`));
+    shallowOnly.push(pktFlush());
+    return Buffer.concat(shallowOnly);
+  }
   const tagWants = wants.filter((want) => {
     const object = repo.getObject(want);
     return object !== undefined && object.type === 'tag';
   });
-  const pack = writePack(collectFetchObjects(repo, plan.commits, tagWants));
-  const parts: Buffer[] = [pkt('NAK\n')];
+  const pack = fetchPack(repo, plan, tagWants, haves, shallows);
+  // v0 order: shallow/unshallow lines, flush, NAK, then the sideband pack.
+  // The flush terminates the shallow section: git's reader stays in its
+  // shallow loop until it sees one, and dies on the NAK otherwise.
+  const parts: Buffer[] = [];
   for (const oid of plan.shallow) parts.push(pkt(`shallow ${oid}\n`));
   for (const oid of plan.unshallow) parts.push(pkt(`unshallow ${oid}\n`));
+  if (plan.shallow.length > 0 || plan.unshallow.length > 0) parts.push(pktFlush());
+  parts.push(pkt('NAK\n'));
   parts.push(...sideband(pack));
   parts.push(pktFlush());
   return Buffer.concat(parts);

@@ -290,8 +290,8 @@ function readPackHeader(data: Buffer, offset: number): { typeCode: number; size:
   return { typeCode, size, next: pos };
 }
 
-/** Read an OFS_DELTA's negative-offset encoding. */
-function readOfsDeltaOffset(data: Buffer, offset: number): { baseOffset: number; next: number } {
+/** Read an OFS_DELTA's negative-offset encoding; the value is relative to the entry's header start. */
+function readOfsDeltaOffset(data: Buffer, offset: number): { value: number; next: number } {
   if (offset >= data.length) throw new Error('ofs-delta offset is truncated');
   let byte = data[offset];
   let pos = offset + 1;
@@ -302,7 +302,7 @@ function readOfsDeltaOffset(data: Buffer, offset: number): { baseOffset: number;
     pos += 1;
     value = ((value + 1) << 7) | (byte & 0x7f);
   }
-  return { baseOffset: offset - value, next: pos };
+  return { value, next: pos };
 }
 
 interface RawPackEntry {
@@ -341,7 +341,7 @@ export function readPack(pack: Buffer, getBase: (oid: string) => GitObject | und
     let entry: RawPackEntry;
     if (header.typeCode === 6) {
       const ofs = readOfsDeltaOffset(pack, offset);
-      entry = { start, typeCode: 6, size: header.size, dataOffset: ofs.next, baseOffset: ofs.baseOffset };
+      entry = { start, typeCode: 6, size: header.size, dataOffset: ofs.next, baseOffset: start - ofs.value };
       offset = ofs.next;
     } else if (header.typeCode === 7) {
       if (offset + 20 > pack.length) throw new Error('ref-delta base id is truncated');

@@ -132,7 +132,7 @@ function paginate<T>(ctx: Ctx, items: readonly T[]): Page<T> {
   const totalPages = Math.max(1, Math.ceil(items.length / perPage));
   const start = (page - 1) * perPage;
   const sliced = items.slice(start, start + perPage);
-  const path = `/api/v3/${ctx.segments.join('/')}`;
+  const path = `/${ctx.segments.join('/')}`;
   const linkFor = (target: number, rel: string): string => {
     const params = new URLSearchParams(ctx.query);
     params.set('page', String(target));
