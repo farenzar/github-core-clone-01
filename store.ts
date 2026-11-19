@@ -82,6 +82,24 @@ export interface FlatEntry {
 
 // ---------------------------------------------------------------- repository
 
+/** A ref map that counts mutations: the advertisement cache keys off it. */
+export class RefMap extends Map<string, string> {
+  version = 0;
+  override set(key: string, value: string): this {
+    this.version += 1;
+    return super.set(key, value);
+  }
+  override delete(key: string): boolean {
+    const had = super.delete(key);
+    if (had) this.version += 1;
+    return had;
+  }
+  override clear(): void {
+    if (this.size > 0) this.version += 1;
+    super.clear();
+  }
+}
+
 export class Repo {
   readonly id: number;
   readonly name: string;
@@ -94,7 +112,7 @@ export class Repo {
   /** Objects by id. Immutable once stored. */
   readonly objects = new Map<string, GitObject>();
   /** Full ref names ('refs/heads/main') to object ids. */
-  readonly refs = new Map<string, string>();
+  readonly refs = new RefMap();
   /** Parsed commits, memoized: objects never change. */
   private readonly commitCache = new Map<string, CommitInfo>();
   /** Parsed trees, memoized. */
@@ -140,6 +158,13 @@ export class Repo {
 
   putObjects(objects: readonly GitObject[]): void {
     for (const object of objects) this.putObject(object.type, object.data);
+  }
+
+  /** Store already-hashed pack objects without re-hashing (readPack computed the ids). */
+  putPackedObjects(objects: readonly { oid: string; type: ObjectType; data: Buffer }[]): void {
+    for (const object of objects) {
+      if (!this.objects.has(object.oid)) this.objects.set(object.oid, { type: object.type, data: object.data });
+    }
   }
 
   getCommit(oid: string): CommitInfo | null {

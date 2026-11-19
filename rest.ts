@@ -5,7 +5,7 @@
 // GraphQL and MCP surfaces share them, so every surface sees one store.
 
 import type { Ctx } from './http.ts';
-import { isRecord, parseJsonBody, sendEmpty, sendError, sendJson } from './http.ts';
+import { JSON_TYPE, isRecord, parseJsonBody, sendEmpty, sendError, sendJson } from './http.ts';
 import {
   FIXED_TIMESTAMP,
   VIEWER,
@@ -18,6 +18,32 @@ import {
 } from './store.ts';
 
 // ---------------------------------------------------------------- shapes
+
+/** Serialized issue JSON, memoized per issue object: an issue's JSON depends
+ * only on its own fields plus the comment count. patchIssue deletes the
+ * entry; a changed comment count rebuilds it. */
+const issueTextCache = new WeakMap<Issue, { text: string; comments: number }>();
+
+/** The issue's JSON text, from the cache when the comment count still matches. */
+function issueJsonText(repo: Repo, issue: Issue): string {
+  const comments = (repo.comments.get(issue.number) ?? []).length;
+  const cached = issueTextCache.get(issue);
+  if (cached !== undefined && cached.comments === comments) return cached.text;
+  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  issueTextCache.set(issue, { text, comments });
+  return text;
+}
+
+/** Send a prebuilt JSON text (no re-stringify). */
+function sendJsonText(ctx: Ctx, status: number, text: string, extra: Record<string, string> = {}): void {
+  ctx.res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': Buffer.byteLength(text),
+    'x-github-request-id': ctx.requestId,
+    ...extra,
+  });
+  ctx.res.end(text);
+}
 
 export function userJson(): Record<string, unknown> {
   return {
@@ -839,7 +865,7 @@ function routeIssues(ctx: Ctx, repo: Repo, rest: readonly string[]): void {
       return;
     }
     if (ctx.method === 'GET') {
-      sendJson(ctx, 200, issueJson(repo, issue));
+      sendJsonText(ctx, 200, issueJsonText(repo, issue));
       return;
     }
     if (ctx.method === 'PATCH') return patchIssue(ctx, repo, issue);
@@ -901,6 +927,7 @@ function createIssue(ctx: Ctx, repo: Repo): void {
 }
 
 function patchIssue(ctx: Ctx, repo: Repo, issue: Issue): void {
+  issueTextCache.delete(issue);
   const parsed = parseJsonBody(ctx);
   if (!parsed.ok) {
     sendError(ctx, 400, 'Problems parsing JSON');

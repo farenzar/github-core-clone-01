@@ -21,6 +21,10 @@ import {
 /** The largest request body accepted (packs in this suite stay far below it). */
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
+/** The shared empty body for bodyless requests: never mutated. */
+const EMPTY_BODY = Buffer.alloc(0);
+
+
 /** Read a request's whole body, or null when it passes the cap. */
 function readBody(req: IncomingMessage): Promise<Buffer | null> {
   return new Promise<Buffer | null>((resolve) => {
@@ -47,17 +51,14 @@ function readBody(req: IncomingMessage): Promise<Buffer | null> {
 }
 
 /** Dispatch one request to its surface. */
-async function dispatch(store: Forge, token: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function dispatch(store: Forge, token: string, authHeader: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const requestId = nextRequestId();
-  let pathname = '/';
-  let query = new URLSearchParams();
-  try {
-    const url = new URL(req.url ?? '/', 'http://forge');
-    pathname = url.pathname;
-    query = url.searchParams;
-  } catch {
-    // An unparseable URL is the root path; routing 404s it.
-  }
+  // Fast path: split path/query without a URL object (no encoded chars in
+  // this suite's paths beyond what splitPath decodes anyway).
+  const rawUrl = req.url ?? '/';
+  const qi = rawUrl.indexOf('?');
+  const pathname = qi < 0 ? rawUrl : rawUrl.slice(0, qi);
+  const query = qi < 0 ? new URLSearchParams() : new URLSearchParams(rawUrl.slice(qi + 1));
   const segments = splitPath(pathname);
   const method = req.method ?? 'GET';
   const host = req.headers.host ?? 'localhost';
@@ -79,14 +80,21 @@ async function dispatch(store: Forge, token: string, req: IncomingMessage, res: 
     return;
   }
 
-  const body = await readBody(req);
+  // GET/HEAD never carry a body in this suite: skip the read (a promise +
+  // three listeners + an event-loop turn per request) and use the shared
+  // empty buffer. Anything else still reads its body.
+  const hasBody =
+    (req.method !== 'GET' && req.method !== 'HEAD') ||
+    (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0') ||
+    req.headers['transfer-encoding'] !== undefined;
+  const body = hasBody ? await readBody(req) : EMPTY_BODY;
   if (body === null) {
     res.writeHead(413, { 'content-type': JSON_TYPE, 'x-github-request-id': requestId });
     res.end('{"message":"Request Entity Too Large"}\n');
     return;
   }
 
-  const ctx: Ctx = { store, req, res, method, segments, query, body, requestId, host, token };
+  const ctx: Ctx = { store, req, res, method, segments, query, body, requestId, host, token, authHeader };
   const git = gitRoute(segments);
   const needsAuth = segments[0] === 'api' || segments[0] === 'mcp' || git !== null;
   if (needsAuth && !isAuthorized(ctx)) {
@@ -96,29 +104,23 @@ async function dispatch(store: Forge, token: string, req: IncomingMessage, res: 
 
   if (segments[0] === 'api' && segments[1] === 'graphql' && segments.length === 2) {
     handleGraphQL(ctx);
-    return;
-  }
-  if (segments[0] === 'api' && segments[1] === 'v3') {
+  } else if (segments[0] === 'api' && segments[1] === 'v3') {
     handleRest(ctx);
-    return;
-  }
-  if (segments[0] === 'mcp' && segments.length === 1) {
+  } else if (segments[0] === 'mcp' && segments.length === 1) {
     handleMcp(ctx);
-    return;
-  }
-  if (git !== null) {
+  } else if (git !== null) {
     handleGit(ctx, git);
-    return;
-  }
-  sendError(ctx, 404, 'Not Found');
-}
+  } else {
+    sendError(ctx, 404, 'Not Found');
+  }}
 
 /** Build the server. It binds nothing until the caller listens. */
 export function createApp(options: { token?: string } = {}): Server {
   const token = options.token ?? process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const authHeader = `Bearer ${token}`;
   const store = new Forge();
   return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void dispatch(store, token, req, res).catch((err: unknown) => {
+    void dispatch(store, token, authHeader, req, res).catch((err: unknown) => {
       try {
         if (!res.headersSent) {
           res.writeHead(500, { 'content-type': JSON_TYPE });

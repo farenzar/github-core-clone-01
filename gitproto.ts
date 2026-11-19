@@ -179,6 +179,22 @@ function receivePackCaps(): string {
   ].join(' ');
 }
 
+/** The v2 capability advertisement: fully static (no refs), built once. */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pkt('# service=git-upload-pack\n'),
+  pktFlush(),
+  pkt('version 2\n'),
+  pkt(`agent=${AGENT}\n`),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow filter\n'),
+  pkt('object-format=sha1\n'),
+  pktFlush(),
+]);
+
+/** v0 advertisements, memoized per (service, ref version): refs change rarely
+ * between advertisements, and a push bumps the version so the next read rebuilds. */
+const v0AdCache = new WeakMap<object, { version: number; service: string; bytes: Buffer }>();
+
 function handleInfoRefs(ctx: Ctx, repo: RepoType): void {
   const service = ctx.query.get('service');
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
@@ -187,19 +203,21 @@ function handleInfoRefs(ctx: Ctx, repo: RepoType): void {
   }
   const wantsV2 =
     service === 'git-upload-pack' && (ctx.req.headers['git-protocol'] ?? '').includes('version=2');
-  const parts: Buffer[] = [pkt(`# service=${service}\n`), pktFlush()];
   if (wantsV2) {
-    parts.push(pkt('version 2\n'));
-    parts.push(pkt(`agent=${AGENT}\n`));
-    parts.push(pkt('ls-refs=unborn\n'));
-    parts.push(pkt('fetch=shallow filter\n'));
-    parts.push(pkt('object-format=sha1\n'));
-    parts.push(pktFlush());
-  } else {
-    parts.push(...v0RefLines(repo, service === 'git-receive-pack' ? receivePackCaps() : uploadPackV0Caps()));
-    parts.push(pktFlush());
+    sendBytes(ctx, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
+    return;
   }
-  sendBytes(ctx, 200, Buffer.concat(parts), `application/x-${service}-advertisement`);
+  const cached = v0AdCache.get(repo);
+  if (cached !== undefined && cached.version === repo.refs.version && cached.service === service) {
+    sendBytes(ctx, 200, cached.bytes, `application/x-${service}-advertisement`);
+    return;
+  }
+  const parts: Buffer[] = [pkt(`# service=${service}\n`), pktFlush()];
+  parts.push(...v0RefLines(repo, service === 'git-receive-pack' ? receivePackCaps() : uploadPackV0Caps()));
+  parts.push(pktFlush());
+  const bytes = Buffer.concat(parts);
+  v0AdCache.set(repo, { version: repo.refs.version, service, bytes });
+  sendBytes(ctx, 200, bytes, `application/x-${service}-advertisement`);
 }
 
 /** The v0 ref lines: HEAD first (caps on the first line), then sorted refs, peeled tags. */
@@ -662,7 +680,7 @@ function handleReceivePack(ctx: Ctx, repo: RepoType): void {
   if (packBytes.length > 0) {
     try {
       const objects = readPack(packBytes, (oid) => repo.getObject(oid));
-      repo.putObjects(objects);
+      repo.putPackedObjects(objects);
     } catch (err) {
       unpackOk = false;
       unpackDetail = err instanceof Error ? err.message.replace(/\s+/g, ' ').trim() : 'unpack failed';

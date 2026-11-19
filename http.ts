@@ -21,6 +21,8 @@ export interface Ctx {
   readonly host: string;
   /** The bearer token this deployment expects ('' refuses everything). */
   readonly token: string;
+  /** The exact Authorization header value expected ('Bearer ' + token). */
+  readonly authHeader: string;
 }
 
 export const JSON_TYPE = 'application/json; charset=utf-8';
@@ -36,8 +38,7 @@ export function nextRequestId(): string {
 /** Whether the request's Authorization header carries the expected bearer token. */
 export function isAuthorized(ctx: Ctx): boolean {
   if (ctx.token === '') return false;
-  const header = ctx.req.headers.authorization;
-  return header === `Bearer ${ctx.token}`;
+  return ctx.req.headers.authorization === ctx.authHeader;
 }
 
 /** Send a JSON body with the standard headers (content-type, length, request id). */
